@@ -1,0 +1,14 @@
+result/
+.vscode/
+data/
+data*/
+__pycache__/
+*log
+log/
+log*
+dataset/
+savept/
+*.out
+G*
+vanilla_d*
+data*
