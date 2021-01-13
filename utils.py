@@ -4,6 +4,7 @@ from torch_geometric.data import Data
 from torch_scatter import scatter
 from inspect import getargspec
 import logging
+import math
 
 def _filter(data, node_idx):
     """
@@ -51,6 +52,14 @@ class Pruner(object):
         else:
             self.ratio1 = self.ratio2 = 1-ratio/2
     
+    def set_rate(self,ratio):
+        if self.style == 'random':
+            self.ratio1=ratio
+        elif self.style == 'truncate':
+            self.ratio2=ratio
+        else:
+            self.ratio1 = self.ratio2 = 1-ratio/2
+
     def Randompruning(self, edge_index, ratio=0.9, ise_id=False):
         E = edge_index.size(1)
         #print(E)
@@ -63,11 +72,19 @@ class Pruner(object):
             return e_id
     
     def Truncation(self,edge_index, ratio=0.9, ise_id=False):
-        ratio = 1000**(ratio-1)
         E = edge_index.size(1)
         src = torch.ones(E).to(edge_index.device)
         deg_hist = scatter(src, edge_index[1], reduce ='sum')
+        aaa = deg_hist.min()
+        if aaa !=0:
+            minmaxrate = aaa / deg_hist.max()
+        else:
+            minmaxrate = 1 / deg_hist.max()
+
+        ratio = math.pow(1 / minmaxrate, ratio-1) + 1e-5
         thold = int(torch.max(deg_hist)*ratio)
+        if thold < 1:
+            thold = 1
         deg_cnt = deg_hist[edge_index[1]]
         num = (deg_hist > thold).nonzero().size(0)
         tot_e_cnt = num * thold
@@ -95,6 +112,8 @@ class Pruner(object):
             return self.Truncation(edge_index, self.ratio2)
         elif self.style == 'hybrid':
             return self.HybridPrune(edge_index, self.ratio1, self.ratio2)
+        elif self.style == 'none':
+            return torch.ones(edge_index.size(1)).bool()
         else:
             print('not implemented')
             return edge_index

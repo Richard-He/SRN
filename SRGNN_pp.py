@@ -1,5 +1,5 @@
 import torch
-from tqdm import tqdm
+import argparse
 import torch.nn.functional as F
 import torch.nn as nn
 from torch_scatter import scatter
@@ -7,12 +7,12 @@ from ogb.nodeproppred import PygNodePropPredDataset
 from evaluate import Evaluator
 from layers import GAT, SAGE, GCN, GEN, MLP
 from torch_geometric.nn import GENConv, DeepGCNLayer
-from torch_geometric.data import RandomNodeSampler
+from sample import RandomNodeSampler
 from torch_geometric.datasets import Reddit, Yelp, Flickr
 from loguru import logger
 from copy import deepcopy
 import pandas as pd
-import argparse
+from utils import Pruner
 import numpy as np
 
 # args = parser.parse_args()
@@ -23,9 +23,15 @@ parser.add_argument('--dataset',type=str, default='protein')
 parser.add_argument('--reset',type=lambda x: (str(x).lower() == 'true'), default=False)
 parser.add_argument('--epochs', type=int, default=2000)
 parser.add_argument('--early', type=int, default=50)
-parser.add_argument('--layers', type=int, default=20)
-parser.add_argument('--num_test_parts', type=int, default=10)
+parser.add_argument('--pstyle', type=str, default='bbp')
+parser.add_argument('--num_test_parts', type=int, default=5)
 parser.add_argument('--num_train_parts', type=int, default=40)
+parser.add_argument('--style', type=str, default='random')
+parser.add_argument('--dropout', type=float, default=0.5)
+parser.add_argument('--wd', type=float,default=5e-3)
+parser.add_argument('--layers', type=int, default=3)
+parser.add_argument('--start', type=float, default=0.05)
+parser.add_argument('--end', type=float, default=1)
 args = parser.parse_args()
 
 gnn = args.gnn
@@ -34,7 +40,6 @@ layers = args.layers
 epochs = args.epochs
 reset = args.reset
 metrics = 'f1' if data_n == 'protein' else 'acc'
-num_layers = args.layers
 gnndict = {'GAT': GAT, 'SAGE': SAGE, 'GCN': GCN, 'GEN': GEN, 'MLP':MLP}
 
 # Set split indices to masks.
@@ -52,7 +57,7 @@ if data_n == 'protein':
     data.x = scatter(data.edge_attr, col, 0, dim_size=data.num_nodes, reduce='add')
 elif data_n == 'product':
     data.y = data.y.squeeze()
-log_name = f'./result/SRGNN_{gnn}_dataset_{data_n}_before_{args.before}_dropout_{args.dropout}_wd_{args.wd}_style_{args.style}'
+log_name = f'./result/SRGNN_{gnn}_dataset_{data_n}_dropout_{args.dropout}_wd_{args.wd}_style_{args.style}_type_{args.pstyle}'
 # log_name = f'logs_version{version}_{times}'
 # Initialize features of nodes by aggregating edge features.
 row, col = data.edge_index
@@ -64,20 +69,16 @@ for split in ['train', 'valid', 'test']:
     data[f'{split}_mask'] = mask
 data['test_mask'] = data['valid_mask'] | data['test_mask']
 
-train_loader = RandomNodeSampler(data, num_parts=args.num_train_parts, shuffle=True,
-                                 num_workers=5)
-test_loader = RandomNodeSampler(data, num_parts=args.num_test_parts, num_workers=5)
-
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if data_n == 'protein':
-    model = gnndict[gnn](in_channels=data.x.size(-1), hidden_channels=64, out_channels=data.y.size(-1), num_layers=layers).to(device)
+    model = gnndict[gnn](in_channels=data.x.size(-1), hidden_channels=64, out_channels=data.y.size(-1), num_layers=layers, dropout=args.dropout).to(device)
 elif data_n == 'product':
-    model = gnndict[gnn](in_channels=data.x.size(-1), hidden_channels=64, out_channels=data.y.max().int().item()+1, num_layers=layers).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    model = gnndict[gnn](in_channels=data.x.size(-1), hidden_channels=64, out_channels=data.y.max().int().item()+1, num_layers=layers, dropout=args.dropout).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=args.wd)
 # criterion = torch.nn.BCEWithLogitsLoss()
 if data_n == 'product':
-    evaluator = Evaluator(data_n,t_ype=2)
+    evaluator = Evaluator(data_n, t_ype=2)
 else:
     evaluator = Evaluator(data_n)
 
@@ -85,17 +86,29 @@ logger.add(log_name)
 logger.info('logname: {}'.format(log_name))
 criterion = nn.BCEWithLogitsLoss() if data_n == 'protein' else nn.CrossEntropyLoss()
 
-def train(epoch):
+pruner = Pruner(style=args.style)
+
+train_loader = RandomNodeSampler(data,pruner=pruner, num_parts=args.num_train_parts, shuffle=True,
+                                 num_workers=5)
+test_loader = RandomNodeSampler(data, num_parts=args.num_test_parts, num_workers=5)
+
+def train():
     model.train()
 
-    # pbar = tqdm(total=len(train_loader))
-    # pbar.set_description(f'Training epoch: {epoch:04d}')
-
     total_loss = total_examples = 0
+    
+    if args.pstyle == 'pbb':
+        train_loader.prune()
+
     for data in train_loader:
         optimizer.zero_grad()
-        data = data.to(device)
-        out = model(data.x, data.edge_index, data.edge_attr)
+        if args.pstyle == 'bbp':
+            mask = pruner.prune(data.edge_index).to(device)
+            data = data.to(device)
+            out = model(data.x, data.edge_index[:,mask], data.edge_attr[mask])
+        else:
+            data = data.to(device)
+            out = model(data.x, data.edge_index, data.edge_attr)
         loss = criterion(out[data.train_mask], data.y[data.train_mask])
         loss.backward()
         optimizer.step()
@@ -103,9 +116,6 @@ def train(epoch):
         total_loss += float(loss) * int(data.train_mask.sum())
         total_examples += int(data.train_mask.sum())
 
-        # pbar.update(1)
- 
-    # pbar.close()
 
     return total_loss / total_examples
 
@@ -162,7 +172,7 @@ def test():
     return train_m, valid_m, test_m, total_loss_train / total_examples_train, total_loss_test / total_examples_test
 # evaluator.num_tasks = data.y.size(1)
 # evaluator.eval_metric = 'acc'
-num_layers = torch.arange(1, num_layers+1, args.intval)
+# num_layers = torch.arange(1, num_layers+1, args.intval)
 # train_list = []
 # val_list = []
 # test_list = []
@@ -170,32 +180,47 @@ num_layers = torch.arange(1, num_layers+1, args.intval)
 # epoch_list = []
 best_val = 0
 val_list = []
+train_list = []
 std_list = []
 ratio_list = []
-rate = find_rate(data.edge_index) + 1e-5
-for j in torch.linspace(rate, 1, 20):
+train_loss_l =[]
+test_loss_l = []
+for j in torch.linspace(args.start, args.end, int((args.end-args.start)/0.05) + 1):
     r_list = []
-    pruner = Pruner(style = args.style, ratio=j)
+    tr_list = []
+    train_l_l =[]
+    test_l_l = []
+    pruner.set_rate(j)
     for i in range(args.runs):
         model.reset_parameters()
         best_val = 0
+        best_train = 0
         best_val_epoch = 0
+        bst_train_loss = 0
+        bst_test_loss = 0
         for epoch in range(1, args.epochs+1):
-            train(pruner=pruner)
-            train_acc, test_acc = test()
+            train()
+            train_acc, _, test_acc, train_loss, test_loss = test()
             if test_acc > best_val :
                 best_val = test_acc
                 best_val_epoch = epoch
-                #logger.info(f'num_layers:{layers}, epochs: {epoch}, train: {train_acc:.4f}, new_best_val: {test_acc:.4f}')
-            # log = 'Epoch: {:03d}, Train: {:.4f}, Test: {:.4f}'
-            # print(log.format(epoch, train_acc, test_acc))
+                best_train = train_acc
+                bst_train_loss = train_loss
+                bst_test_loss = test_loss
             if epoch - best_val_epoch > args.early:
                 r_list.append(best_val)
+                tr_list.append(best_train)
+                train_l_l.append(bst_train_loss)
+                test_l_l.append(bst_test_loss)
                 break
     logger.info(f'ratio:{j:.4f} test_acc: {np.mean(r_list):.4f}, std: {np.std(r_list):.4f}')
     ratio_list = ratio_list + [j.item()] * len(r_list)
     val_list = val_list + r_list
-logger.info(f'ratio_list = {np.array(ratio_list)}, val_list = {np.array(val_list)}')
+    train_list = train_list + tr_list
+    train_loss_l = train_loss_l + train_l_l
+    test_loss_l = test_loss_l + test_l_l
+logger.info(f'ratio_list = {np.array(ratio_list)}, train_list = {np.array(train_list)}, val_list = {np.array(val_list)}, train_loss = {np.array(train_loss_l)},'
+            f'test_loss = {np.array(test_loss_l)}')
 
 # for layers in num_layers:
 #     # best_train = 0

@@ -21,14 +21,14 @@ parser.add_argument('--runs',type=int, default=10)
 parser.add_argument('--gnn', type=str, default='MLP')
 parser.add_argument('--reset',type=lambda x: (str(x).lower() == 'true'), default=False)
 
-parser.add_argument('--dataset',type=str, default='Cora')
+parser.add_argument('--dataset',type=str, default='Pubmed')
 
 parser.add_argument('--ratio', type=float, default=0.1)
 parser.add_argument('--layers', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=800)
-parser.add_argument('--early', type=int, default=40)
-parser.add_argument('--wd', type=float,default=5e-3)
-parser.add_argument('--dropout', type=float, default=0.5)
+parser.add_argument('--early', type=int, default=30)
+parser.add_argument('--wd', type=float,default=0)
+parser.add_argument('--dropout', type=float, default=0)
 # parser.add_argument('--prate',type=float,default=0.5)
 parser.add_argument('--pratio', type=float, default=0.8)
 parser.add_argument('--style', type=str, default='random')
@@ -60,7 +60,7 @@ if dataset_n == 'arxiv':
     data.train_mask = data.train_mask.bool()
     data.test_mask = ~ (data.train_mask)
     data.y = data.y.squeeze()
-    
+
 else:
     if dataset_n == 'dblp':
         dataset = CitationFull(path, dataset_n)
@@ -112,10 +112,11 @@ best_val = 0
 val_list = []
 std_list = []
 ratio_list = []
-rate = find_rate(data.edge_index) + 1e-5
-for j in torch.linspace(rate, 1, 20):
+pruner = Pruner(style=args.style)
+for j in torch.linspace(0.05, 1, 20):
+    print('j',j)
     r_list = []
-    pruner = Pruner(style = args.style, ratio=j)
+    pruner.set_rate(j)
     for i in range(args.runs):
         model.reset_parameters()
         best_val = 0
